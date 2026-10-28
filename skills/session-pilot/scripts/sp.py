@@ -400,6 +400,9 @@ def rank(items, query, k=5):
         for t, f in tf.items():
             idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
             s += idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * len(body) / avg))
+        name_hits = [t for t in q if t in names]
+        if name_hits:
+            s *= (1.0 + 0.8 * len(name_hits))
         if it["n"].lower() in qlow or it["n"].lower().replace("-", " ") in qlow:
             s *= 1.5
         cov = len(tf) / len(q)
@@ -417,13 +420,16 @@ def rank(items, query, k=5):
     return q, best
 
 
-def strength(best):
+def strength(best, q=None):
     if not best:
         return "none"
-    s, cov, _ = best[0]
-    if cov >= 0.5 and s >= 10:
+    s, cov, it = best[0]
+    names = set(tokens(it["n"].replace("-", " ").replace("_", " ")))
+    has_name_hit = any(t in names for t in (q or []))
+
+    if (has_name_hit and s >= 6.5) or (cov >= 0.35 and s >= 8.0) or (s >= 11.0):
         return "strong"
-    if cov >= 0.3 and s >= 5:
+    if (has_name_hit and s >= 3.0) or (cov >= 0.20 and s >= 3.5) or (s >= 5.0):
         return "weak"
     return "none"
 
@@ -758,7 +764,7 @@ def cmd_find(a):
     q, best = rank(items, a.query, a.k)
     if a.kind:
         best = [b for b in best if b[2]["k"] == a.kind]
-    st = strength(best)
+    st = strength(best, q)
     out(f"match: {st} | indexed {len(items)} | terms: {' '.join(q) or '-'}")
     for i, (s, cov, it) in enumerate(best, 1):
         out(f"{i}. {it['n']} [{it['k']},{it['s']}] score={s:.1f} cov={cov:.0%}")

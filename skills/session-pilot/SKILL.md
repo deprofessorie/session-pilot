@@ -34,18 +34,24 @@ If you can't hold an id, omit the flag: memory is then per-project (cwd).
    - *Chat / simple question / opinion* → answer directly in lean mode. Done.
    - *Task* (build, fix, analyze, write, research, automate, multi-step) → step 3.
 
-3. **Route (tasks only):** condense the task to 4–10 keywords, then
-   `SP find "<keywords>" -k 5`. Read the `match:` line:
-   - `strong` → read **only** result #1's SKILL.md (path given) and follow it.
-     Results within ~15% of #1's score that cover the same job are alternatives;
-     use #2 only if #1 doesn't fit after reading it. Pull in a second skill only
-     when the task clearly spans two domains.
-   - `weak` → if #1's description genuinely fits, use it; otherwise treat as `none`.
-   - `none` → ask once: *"No installed skill covers this well. Want me to search
-     for and install one (marketplace / skills.sh / GitHub)?"* If yes, search,
-     propose the best 1–2 with source links, install only after approval, then
-     `SP index`. If no, use the closest local match from the list, or your own
-     general ability, and say which.
+3. **Route (tasks only):** 
+   - **Query Functional Disciplines & Roles, NOT Domain Subject Nouns:**
+     - Always strip application domain nouns (e.g. "family tree", "dog shelter", "flower shop", "crypto portfolio"). These describe the user's subject matter, not the software engineering tools.
+     - Extract the core technologies, frameworks, and engineering roles:
+       - System Design & Stack Architecture → `software architect`, `backend architect`
+       - Frontend & UI/UX → `react frontend developer`, `ui designer`, `frontend patterns`
+       - Backend & APIs → `backend architect`, `fastapi patterns`, `database optimizer`
+       - Testing, Auth & Security → `react testing`, `application security engineer`
+     - Query with 2–5 technical/role keywords: `SP find "<tech/role keywords>" -k 5`.
+   - **Multi-Discipline / Fullstack Applications:**
+     - When building a complete fullstack app, activate the architecture lead first (`agency-software-architect`) to establish domain models and boundaries, then bring in stack specialists (`agency-frontend-developer`, `agency-backend-architect`, `agency-ui-designer`, `agency-application-security-engineer`).
+   - Read the `match:` line:
+     - `strong` → read **only** result #1's SKILL.md (path given) and follow it.
+       Results within ~15% of #1's score that cover the same job are alternatives;
+       use #2 only if #1 doesn't fit after reading it. Pull in a second skill only
+       when the task clearly spans two domains.
+     - `weak` → if #1's description genuinely fits, use it; otherwise re-triage by functional role (e.g. query the specialist role directly).
+     - `none` → re-triage by functional discipline first. If still none, ask once: *"No installed skill covers this well. Want me to search for and install one?"* Never silently abandon routing for generic unguided code.
 
 4. **Checkpoint** after each meaningful step and before your final reply:
    `SP save --session <id> --done "<what finished>" --next "<next step>" [--skill <name>]`
