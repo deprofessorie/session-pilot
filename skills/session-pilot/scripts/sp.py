@@ -14,6 +14,10 @@ Stdlib only, Python 3.8+. Output is deliberately terse to save tokens.
   sp.py daemon   [start|stop|status]            background indexer service
   sp.py changelog [-k 5]                        recent skill additions/removals
   sp.py sessions | forget ID | prune --days N   manage memory
+  sp.py gc       [--days N]                     purge memory of deleted chats/projects
+  sp.py forget-project [PATH]                   delete all memory for a project
+  sp.py import-project [PATH] [--adopt]         read instructions, wire rules & reconcile
+  sp.py reconcile [PATH] [--adopt]              compare project skills vs system skills
   sp.py style    [set "text"]                   global default style
 """
 import argparse
@@ -22,12 +26,13 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HOME = Path(os.environ.get("SESSION_PILOT_HOME") or (Path.home() / ".session-pilot"))
 INDEX_FILE = HOME / "index.json"
 SESS_DIR = HOME / "sessions"
@@ -62,6 +67,12 @@ PROJECT_ROOTS = [
     (".claude/skills", "skill"), (".claude/agents", "agent"),
     (".github/skills", "skill"), (".codex/skills", "skill"),
     (".cursor/skills", "skill"), (".gemini/skills", "skill"),
+    ("skills", "skill"), (".skills", "skill"),
+]
+
+INSTRUCTION_FILES = [
+    "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules",
+    ".windsurfrules", ".github/copilot-instructions.md", "README.md"
 ]
 
 STOP = set("""a an the and or but if then so to of in on at by for with from into onto
@@ -105,6 +116,21 @@ def load_json(path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
+
+
+def primary_global_skills_dir():
+    """Return primary destination for newly adopted global skills."""
+    candidates = [
+        Path.home() / ".gemini" / "config" / "skills",
+        Path.home() / ".claude" / "skills",
+        Path.home() / ".cursor" / "skills",
+        Path.home() / ".codex" / "skills",
+        Path.home() / ".agents" / "skills",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return candidates[0]
 
 
 # ------------------------------------------------------------- daemon/process
@@ -427,10 +453,226 @@ def ago(ts):
     return "just now"
 
 
+def gc_sessions(days=None):
+    """Purge sessions whose project directories or conversation transcripts no longer exist."""
+    pruned = []
+    now = time.time()
+    cutoff = (now - days * 86400) if days else None
+    brain_root = Path.home() / ".gemini" / "antigravity" / "brain"
+
+    for f in list(SESS_DIR.glob("*.json")):
+        s = load_json(f, None)
+        if not s or not isinstance(s, dict):
+            try:
+                f.unlink()
+                pruned.append((f.stem, "corrupt"))
+            except OSError:
+                pass
+            continue
+
+        if cutoff and s.get("updated", s.get("created", 0)) < cutoff:
+            try:
+                f.unlink()
+                pruned.append((f.stem, "expired"))
+            except OSError:
+                pass
+            continue
+
+        cwd = s.get("cwd")
+        if cwd and not Path(cwd).exists():
+            try:
+                f.unlink()
+                pruned.append((f.stem, f"project deleted ({cwd})"))
+            except OSError:
+                pass
+            continue
+
+        bdir = s.get("brain_dir")
+        if bdir and not Path(bdir).exists():
+            try:
+                f.unlink()
+                pruned.append((f.stem, f"chat deleted ({bdir})"))
+            except OSError:
+                pass
+            continue
+
+        sid = s.get("id", f.stem)
+        if brain_root.is_dir() and len(sid) == 36 and sid.count("-") == 4:
+            if not (brain_root / sid).exists():
+                try:
+                    f.unlink()
+                    pruned.append((f.stem, "chat deleted"))
+                except OSError:
+                    pass
+                continue
+
+    return pruned
+
+
+# -------------------------------------------------- project & skills analysis
+def scan_project_instructions(project_dir):
+    """Find and summarize instructions from standard project rule files."""
+    pdir = Path(project_dir).resolve()
+    found = []
+    for rel in INSTRUCTION_FILES:
+        path = pdir / rel
+        if path.is_file():
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                lines = [line.strip() for line in text.splitlines()
+                         if line.strip() and not line.startswith("<!--") and not line.startswith("-->")]
+                summary = " ".join(lines[:6])
+                found.append({"file": rel, "path": str(path), "summary": short(summary, 220), "size": len(text)})
+            except OSError:
+                pass
+    crules = pdir / ".cursor" / "rules"
+    if crules.is_dir():
+        for mdc in sorted(crules.glob("*.mdc")):
+            try:
+                text = mdc.read_text(encoding="utf-8", errors="replace")
+                fm = frontmatter(mdc)
+                desc = fm.get("description") or short(" ".join(text.splitlines()[:4]), 120)
+                found.append({"file": f".cursor/rules/{mdc.name}", "path": str(mdc), "summary": desc, "size": len(text)})
+            except OSError:
+                pass
+    return found
+
+
+def skill_capability_score(skill_entry):
+    """Compute capability score based on scripts, references, tests, and instruction depth."""
+    p = Path(skill_entry.get("p", ""))
+    s_dir = p.parent if p.name == "SKILL.md" else p
+    score = 10
+    if not s_dir.is_dir():
+        return score
+    scripts = s_dir / "scripts"
+    if scripts.is_dir():
+        script_files = list(scripts.glob("*.py")) + list(scripts.glob("*.sh")) + list(scripts.glob("*.js"))
+        score += 20 + len(script_files) * 5
+    for sub in ("references", "examples", "resources"):
+        if (s_dir / sub).is_dir():
+            score += 10
+    tests = s_dir / "tests"
+    if tests.is_dir():
+        score += 15
+    try:
+        size = p.stat().st_size
+        score += min(30, int(size / 300))
+    except OSError:
+        pass
+    return score
+
+
+def reconcile_project_skills(project_dir, auto_adopt=False):
+    """Compare project-local skills with globally installed skills.
+    Decide whether to implement more capable global skills or adopt project skills.
+    """
+    pdir = Path(project_dir).resolve()
+    project_skills = []
+    seen = set()
+    for rel_root, kind in PROJECT_ROOTS:
+        root = pdir / rel_root
+        if root.is_dir():
+            for e in scan_root(root, kind):
+                if e["n"] not in seen:
+                    seen.add(e["n"])
+                    project_skills.append(e)
+
+    if not project_skills:
+        return []
+
+    system_items = [it for it in build_index(cwd=str(pdir)) if it.get("s") in ("global", "extra")]
+    results = []
+    target_global_dir = primary_global_skills_dir()
+
+    for ps in project_skills:
+        p_score = skill_capability_score(ps)
+        q, best = rank(system_items, f"{ps['n']} {ps['d']}", k=3)
+        match_level = strength(best)
+
+        decision = "adopt_project"
+        matching_global = None
+        reason = "no matching installed skill"
+
+        if best and match_level in ("strong", "weak"):
+            top_global = best[0][2]
+            g_score = skill_capability_score(top_global)
+            matching_global = top_global
+            if g_score > p_score + 5:
+                decision = "use_global"
+                reason = f"global skill {top_global['n']} is more capable (score {g_score} vs {p_score})"
+            elif p_score >= g_score:
+                decision = "adopt_project"
+                reason = f"project skill has specialized project instructions (score {p_score} vs {g_score})"
+            else:
+                decision = "use_global"
+                reason = f"using installed {top_global['n']}"
+        else:
+            decision = "adopt_project"
+            reason = "no installed skill fits domain; adopting project skill"
+
+        adopted_path = None
+        if decision == "adopt_project" and auto_adopt:
+            src = Path(ps["p"]).parent if Path(ps["p"]).name == "SKILL.md" else Path(ps["p"])
+            dest = target_global_dir / ps["n"]
+            try:
+                target_global_dir.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(src, dest)
+                else:
+                    dest.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest / src.name)
+                adopted_path = str(dest)
+                clog = load_json(CHANGELOG_FILE, [])
+                clog.insert(0, {"t": time.time(), "added": [ps["n"]], "removed": [],
+                                "note": f"Adopted from project {pdir.name}"})
+                atomic_write(CHANGELOG_FILE, clog[:50])
+            except Exception as e:
+                reason += f" (adopt error: {e})"
+
+        results.append({
+            "name": ps["n"],
+            "project_path": ps["p"],
+            "decision": decision,
+            "reason": reason,
+            "global_match": matching_global["n"] if matching_global else None,
+            "global_path": matching_global["p"] if matching_global else None,
+            "adopted_path": adopted_path
+        })
+
+    if any(r.get("adopted_path") for r in results):
+        build_index(rebuild=True)
+
+    return results
+
+
 # ------------------------------------------------------------------ commands
 def cmd_recall(a):
     sid = session_id(a.session)
     s = load_session(sid)
+    if s:
+        # Check if project or chat was deleted
+        cwd = s.get("cwd")
+        if cwd and not Path(cwd).exists():
+            f = SESS_DIR / f"{sid}.json"
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            s = None
+        bdir = s.get("brain_dir") if s else None
+        if bdir and not Path(bdir).exists():
+            f = SESS_DIR / f"{sid}.json"
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            s = None
+
     style = (s or {}).get("style") or load_json(PROFILE, {}).get("style")
     if not s:
         out(f"NEW SESSION {sid}")
@@ -472,8 +714,20 @@ def cmd_recall(a):
 def cmd_save(a):
     sid = session_id(a.session)
     now = time.time()
+    cwd_str = str(Path(getattr(a, "cwd", None) or os.getcwd()).resolve())
     s = load_session(sid) or {"id": sid, "created": now, "checkpoints": [], "skills": [],
-                              "history": [], "cwd": os.getcwd()}
+                              "history": [], "cwd": cwd_str}
+    s["cwd"] = cwd_str
+    conv_id = getattr(a, "conv_id", None) or os.environ.get("CONVERSATION_ID") or os.environ.get("SESSION_PILOT_CONV_ID")
+    if conv_id:
+        s["conv_id"] = conv_id
+    brain_root = Path.home() / ".gemini" / "antigravity" / "brain"
+    if brain_root.is_dir():
+        for candidate in (conv_id, sid):
+            if candidate and (brain_root / candidate).is_dir():
+                s["brain_dir"] = str(brain_root / candidate)
+                break
+
     for key in ("title", "goal", "style", "status"):
         val = getattr(a, key)
         if val:
@@ -568,6 +822,24 @@ def cmd_forget(a):
         out("no such session")
 
 
+def cmd_forget_project(a):
+    target = str(Path(a.path or os.getcwd()).resolve()).lower()
+    pruned = []
+    for f in list(SESS_DIR.glob("*.json")):
+        s = load_json(f, {})
+        cwd = s.get("cwd")
+        if cwd and str(Path(cwd).resolve()).lower() == target:
+            try:
+                f.unlink()
+                pruned.append(f.stem)
+            except OSError:
+                pass
+    if pruned:
+        out(f"forgot {len(pruned)} session(s) for project {target}")
+    else:
+        out(f"no memory found for project {target}")
+
+
 def cmd_prune(a):
     cutoff, n = time.time() - a.days * 86400, 0
     for f in SESS_DIR.glob("*.json"):
@@ -575,6 +847,113 @@ def cmd_prune(a):
             f.unlink()
             n += 1
     out(f"pruned {n}")
+
+
+def cmd_gc(a):
+    pruned = gc_sessions(days=a.days)
+    if not pruned:
+        out("clean: no orphaned or deleted session memory")
+    else:
+        out(f"pruned {len(pruned)} session(s):")
+        for sid, reason in pruned[:10]:
+            out(f"  - {sid}: {reason}")
+        if len(pruned) > 10:
+            out(f"  ... and {len(pruned)-10} more")
+
+
+def cmd_reconcile(a):
+    pdir = Path(a.path or os.getcwd()).resolve()
+    reconciled = reconcile_project_skills(pdir, auto_adopt=a.adopt)
+    if not reconciled:
+        out(f"No project-local skills found in {pdir}")
+        return
+    out(f"Reconciled {len(reconciled)} project skill(s) in {pdir.name}:")
+    for r in reconciled:
+        if r["decision"] == "use_global":
+            out(f"- {r['name']}: [USE GLOBAL] {r['global_match']}")
+            out(f"  {r['reason']}")
+            out(f"  Path: {r['global_path']}")
+        else:
+            adopted = f" (installed to {r['adopted_path']})" if r.get("adopted_path") else ""
+            out(f"- {r['name']}: [ADOPT PROJECT]{adopted}")
+            out(f"  {r['reason']}")
+            out(f"  Path: {r['project_path']}")
+
+
+def cmd_import_project(a):
+    pdir = Path(a.path or os.getcwd()).resolve()
+    if not pdir.is_dir():
+        out(f"error: project directory does not exist: {pdir}")
+        return
+
+    out(f"PROJECT: {pdir.name} ({pdir})")
+
+    # 1. Project instructions
+    instructions = scan_project_instructions(pdir)
+    if instructions:
+        out("Instructions found:")
+        for inst in instructions:
+            out(f"  - {inst['file']} ({inst['size']} bytes): {inst['summary']}")
+    else:
+        out("Instructions: No dedicated instruction files found (proceeding with standard pilot)")
+
+    # 2. Wire Session Pilot into project if needed
+    agents_md = pdir / "AGENTS.md"
+    bootstrap_snippet = (
+        "\n<!-- session-pilot:start -->\n"
+        "## Session Pilot (always on)\n\n"
+        "At the start of every chat, and on each new prompt, follow the `session-pilot` skill:\n"
+        "recall this chat's memory, answer simple questions directly in lean mode, route\n"
+        "tasks to the best installed skill (`sp.py find`), mirror the user's tone, and\n"
+        "checkpoint progress (`sp.py save`) after meaningful steps.\n"
+        "<!-- session-pilot:end -->\n"
+    )
+    if not agents_md.exists():
+        if a.wire:
+            try:
+                agents_md.write_text("# Project Guidelines\n" + bootstrap_snippet, encoding="utf-8")
+                out("Session Pilot: wired into new AGENTS.md")
+            except OSError:
+                pass
+    else:
+        try:
+            content = agents_md.read_text(encoding="utf-8", errors="replace")
+            if "session-pilot:start" not in content and a.wire:
+                agents_md.write_text(content.rstrip() + "\n" + bootstrap_snippet, encoding="utf-8")
+                out("Session Pilot: added always-on rule to AGENTS.md")
+        except OSError:
+            pass
+
+    # 3. Reconcile project skills vs global skills
+    reconciled = reconcile_project_skills(pdir, auto_adopt=a.adopt)
+    if reconciled:
+        out("Project Skills Reconciliation:")
+        for r in reconciled:
+            if r["decision"] == "use_global":
+                out(f"  * {r['name']}: [USE GLOBAL] -> {r['global_match']}")
+                out(f"    Reason: {r['reason']}")
+            else:
+                adopt_note = f" -> adopted to {r['adopted_path']}" if r.get("adopted_path") else ""
+                out(f"  * {r['name']}: [ADOPT PROJECT]{adopt_note}")
+                out(f"    Reason: {r['reason']}")
+    else:
+        out("Skills: No project-local skills found (using system skills)")
+
+    # 4. Save session checkpoint marking project imported
+    sid = session_id(a.session)
+    now = time.time()
+    s = load_session(sid) or {"id": sid, "created": now, "checkpoints": [], "skills": [],
+                              "history": [], "cwd": str(pdir)}
+    s["cwd"] = str(pdir)
+    s["title"] = f"Project {pdir.name}"
+    s["checkpoints"].append({
+        "t": now,
+        "done": f"Imported project {pdir.name} and initialized instructions",
+        "next": "Implement project instructions and commence task"
+    })
+    s["updated"] = now
+    atomic_write(SESS_DIR / f"{sid}.json", s)
+    out(f"Project imported and ready. Session memory initialized ({sid}).")
 
 
 def cmd_style(a):
@@ -624,9 +1003,11 @@ def cmd_watch(a):
     atomic_write(DAEMON_PID_FILE, {"pid": pid, "start": time.time()})
     log_daemon(f"Session Pilot watcher started (PID {pid}, interval {interval}s)")
     out(f"Session Pilot watcher running (PID {pid}, interval {interval}s)")
+    last_gc = time.time()
     try:
         while True:
-            atomic_write(HEARTBEAT_FILE, {"t": time.time(), "pid": pid})
+            now = time.time()
+            atomic_write(HEARTBEAT_FILE, {"t": now, "pid": pid})
             try:
                 added, removed = check_for_changes()
                 if added or removed:
@@ -637,6 +1018,12 @@ def cmd_watch(a):
                         msg += f" -{len(removed)} removed"
                     log_daemon(msg)
                     out(f"[{time.strftime('%H:%M:%S')}] {msg}")
+                # Periodic GC for deleted projects / chats
+                if now - last_gc > 60:
+                    pruned = gc_sessions()
+                    if pruned:
+                        log_daemon(f"Garbage collected {len(pruned)} deleted session(s)")
+                    last_gc = now
             except Exception as e:
                 log_daemon(f"Watcher scan error: {e}")
                 out(f"Watcher scan error: {e}")
@@ -715,6 +1102,8 @@ def main(argv=None):
 
     s = sub.add_parser("save")
     s.add_argument("--session")
+    s.add_argument("--conv-id")
+    s.add_argument("--cwd")
     for opt in ("title", "goal", "done", "next", "style", "status"):
         s.add_argument("--" + opt)
     s.add_argument("--skill", action="append")
@@ -760,9 +1149,17 @@ def main(argv=None):
     fg.add_argument("session")
     fg.set_defaults(fn=cmd_forget)
 
+    fp = sub.add_parser("forget-project")
+    fp.add_argument("path", nargs="?", default=None)
+    fp.set_defaults(fn=cmd_forget_project)
+
     pr = sub.add_parser("prune")
     pr.add_argument("--days", type=int, default=90)
     pr.set_defaults(fn=cmd_prune)
+
+    gc_p = sub.add_parser("gc")
+    gc_p.add_argument("--days", type=int, default=None)
+    gc_p.set_defaults(fn=cmd_gc)
 
     st = sub.add_parser("style")
     st.add_argument("text", nargs="*")
@@ -771,6 +1168,19 @@ def main(argv=None):
     pf = sub.add_parser("prefer")
     pf.add_argument("optimizer")
     pf.set_defaults(fn=cmd_prefer)
+
+    rc = sub.add_parser("reconcile")
+    rc.add_argument("path", nargs="?", default=None)
+    rc.add_argument("--adopt", action="store_true")
+    rc.set_defaults(fn=cmd_reconcile)
+
+    ip = sub.add_parser("import-project")
+    ip.add_argument("path", nargs="?", default=None)
+    ip.add_argument("--session")
+    ip.add_argument("--wire", action="store_true", default=True)
+    ip.add_argument("--no-wire", dest="wire", action="store_false")
+    ip.add_argument("--adopt", action="store_true")
+    ip.set_defaults(fn=cmd_import_project)
 
     a = p.parse_args(argv)
     if a.cmd == "style" and a.text and a.text[0] == "set":

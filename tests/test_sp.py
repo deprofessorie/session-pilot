@@ -111,9 +111,7 @@ class SPTest(unittest.TestCase):
         self.assertIn("no sessions", self.run_sp("sessions"))
 
     def test_check_for_changes_and_changelog(self):
-        # Initial index build
         self.run_sp("index")
-        # Add a new skill
         skill(self.skills, "new-skill-x", "A newly added skill description")
         added, removed = self.sp.check_for_changes()
         self.assertEqual(added, ["new-skill-x"])
@@ -125,11 +123,68 @@ class SPTest(unittest.TestCase):
         self.run_sp("index")
         self.run_sp("save", "--session", "s-old", "--goal", "work")
         time.sleep(0.05)
-        # Add a new skill and record change
         skill(self.skills, "hot-tool", "Brand new tool added during conversation")
         self.sp.check_for_changes()
         out = self.run_sp("recall", "--session", "s-old")
         self.assertIn("New skills installed since last checkpoint: hot-tool", out)
+
+    def test_gc_purges_deleted_project(self):
+        pdir = self.tmp / "proj-alpha"
+        pdir.mkdir(parents=True)
+        self.run_sp("save", "--session", "sess-proj", "--cwd", str(pdir), "--goal", "build something")
+        self.assertIn("sess-proj", self.run_sp("sessions"))
+        # Delete project directory
+        shutil.rmtree(pdir)
+        gc_out = self.run_sp("gc")
+        self.assertIn("pruned 1 session(s)", gc_out)
+        self.assertIn("sess-proj", gc_out)
+        self.assertIn("no sessions", self.run_sp("sessions"))
+
+    def test_recall_purges_deleted_project(self):
+        pdir = self.tmp / "proj-beta"
+        pdir.mkdir(parents=True)
+        self.run_sp("save", "--session", "sess-beta", "--cwd", str(pdir), "--goal", "build beta")
+        # Delete project directory
+        shutil.rmtree(pdir)
+        # Recall should detect deletion and return NEW SESSION
+        out = self.run_sp("recall", "--session", "sess-beta")
+        self.assertIn("NEW SESSION sess-beta", out)
+
+    def test_import_project_and_instructions(self):
+        pdir = self.tmp / "proj-gamma"
+        pdir.mkdir(parents=True)
+        (pdir / "AGENTS.md").write_text("# Project Gamma Rules\nAlways use strict typing.\n", encoding="utf-8")
+        out = self.run_sp("import-project", str(pdir), "--session", "sess-gamma")
+        self.assertIn("PROJECT: proj-gamma", out)
+        self.assertIn("AGENTS.md", out)
+        self.assertIn("Always use strict typing", out)
+        self.assertIn("Session Pilot: added always-on rule to AGENTS.md", out)
+        # Check AGENTS.md now contains bootstrap
+        content = (pdir / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("session-pilot:start", content)
+
+    def test_reconcile_and_adopt_project_skill(self):
+        # Give global fastapi-patterns a helper script so it has higher capability
+        (self.skills / "fastapi-patterns" / "scripts").mkdir(parents=True, exist_ok=True)
+        (self.skills / "fastapi-patterns" / "scripts" / "helper.py").write_text("# helper", encoding="utf-8")
+
+        pdir = self.tmp / "proj-delta"
+        local_skills = pdir / ".gemini" / "skills"
+        local_skills.mkdir(parents=True)
+        # 1. Project has a custom specialized skill not present in global
+        skill(local_skills, "custom-billing-engine", "Custom billing calculation for project delta")
+        # 2. Project has a basic copy of an existing global skill
+        skill(local_skills, "fastapi-patterns", "Basic fastapi starter")
+
+        out = self.run_sp("reconcile", str(pdir))
+        # fastapi-patterns should prefer global
+        self.assertIn("fastapi-patterns: [USE GLOBAL]", out)
+        # custom skill should adopt project
+        self.assertIn("custom-billing-engine: [ADOPT PROJECT]", out)
+
+        # Test adopting into global skills
+        adopt_out = self.run_sp("reconcile", str(pdir), "--adopt")
+        self.assertIn("[ADOPT PROJECT] (installed to", adopt_out)
 
 
 if __name__ == "__main__":

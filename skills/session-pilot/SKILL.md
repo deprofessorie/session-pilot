@@ -1,9 +1,9 @@
 ---
 name: session-pilot
-description: Per-chat memory and task router. Use at the start of every conversation and on each new user prompt to recall where this chat left off, pick the best installed skill/agent/plugin for the task, keep token use low, mirror the user's tone, and checkpoint progress so the next message (or a resumed chat) continues seamlessly. Skip routing for small talk and simple questions.
+description: Per-chat memory, project instruction onboarding, and task router. Use at the start of every conversation and on each new user prompt to recall where this chat left off, pick the best installed skill/agent/plugin for the task, align with imported project instructions, keep token use low, mirror the user's tone, and checkpoint progress so the next message (or a resumed chat) continues seamlessly. Skip routing for small talk and simple questions.
 license: MIT
 metadata:
-  version: "1.0.0"
+  version: "1.2.0"
 ---
 
 # Session Pilot
@@ -28,6 +28,7 @@ If you can't hold an id, omit the flag: memory is then per-project (cwd).
    `SP recall --session <id>`. `NEW SESSION` means a fresh start. Otherwise
    continue from the last `next:` item — don't re-ask what memory already answers.
    Skip recall when the conversation history is still in your context.
+   *Note: If the underlying chat or project directory was deleted, `recall` automatically purges orphaned memory.*
 
 2. **Triage the prompt in your head (no tool call):**
    - *Chat / simple question / opinion* → answer directly in lean mode. Done.
@@ -51,6 +52,24 @@ If you can't hold an id, omit the flag: memory is then per-project (cwd).
    On the first save also pass `--title "<3–6 words>" --goal "<one line>"`.
    Mark `--status done` when the goal is complete. There is no reliable
    "chat closed" event, so the latest checkpoint *is* the saved end state.
+
+## Project Import & Skill Reconciliation
+
+When opening, cloning, or importing a project:
+1. **Import instructions:** Run `SP import-project [PATH]`.
+   - Surfaces existing guidelines (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `README.md`) so you immediately implement the project's instructions.
+   - Wires Session Pilot bootstrap rules into the project so memory and routing remain active.
+2. **Reconcile project-local skills:** Run `SP reconcile [PATH] [--adopt]`.
+   - If the project includes local skills (in `skills/`, `.gemini/skills/`, `.cursor/skills/`, etc.):
+     - Compares capability against installed system skills.
+     - If an installed system skill is more capable: implements the system skill.
+     - If no system skill fits or the project skill has custom domain rules: **adopts the project skill** into system skills so all agents have access.
+
+## Automatic Memory Lifecycle (Deletions & GC)
+
+- **Chat deletion:** If a user deletes a chat/conversation, its memory is automatically purged upon `recall` or by the background daemon.
+- **Project deletion:** If a user deletes an entire project folder, all session checkpoints associated with that project are automatically garbage collected (`SP gc`).
+- **Explicit project purge:** Run `SP forget-project [PATH]` to clear all saved memory for a given directory.
 
 ## Lean mode (always on)
 
@@ -87,7 +106,12 @@ changes.
 | `recall --session ID [--last N]` | Compact memory for this chat |
 | `save --session ID --done .. --next .. [--title --goal --skill --style --status --global-style]` | Checkpoint |
 | `find "keywords" [-k 5] [--kind skill\|agent\|plugin]` | Ranked capabilities |
+| `import-project [PATH] [--adopt]` | Scan instructions, wire rules & reconcile |
+| `reconcile [PATH] [--adopt]` | Compare project vs system skills (adopt if none fits) |
+| `gc [--days N]` | Purge memory of deleted chats/projects |
+| `forget-project [PATH]` | Delete all memory for a project folder |
 | `optimizers` | Installed context/token-saving skills |
 | `index [--rebuild]` / `roots` | Refresh index / show scanned folders |
 | `sessions` · `forget ID` · `prune --days 90` | Manage memory |
 | `style set "..."` · `prefer <skill>` | Global default style / pinned optimizer |
+| `daemon [start\|stop\|status]` | Background watcher & auto-GC service |
