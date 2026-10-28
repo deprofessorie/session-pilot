@@ -39,6 +39,7 @@ class SPTest(unittest.TestCase):
             "SESSION_PILOT_HOME": str(self.tmp / "home"),
             "SESSION_PILOT_NO_DEFAULT_ROOTS": "1",
             "SESSION_PILOT_ROOTS": os.pathsep.join([str(self.skills), "agent=" + str(self.agents)]),
+            "SESSION_PILOT_NO_AUTO_CONV": "1",
         })
         os.environ.pop("SESSION_PILOT_ID", None)
         import importlib
