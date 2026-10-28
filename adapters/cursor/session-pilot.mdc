@@ -1,0 +1,10 @@
+---
+description: Session Pilot - per-chat memory, skill routing, lean answers
+alwaysApply: true
+---
+
+At the start of every chat, and on each new prompt, follow the `session-pilot` skill
+(`.cursor/skills/session-pilot/SKILL.md`): recall this chat's memory, answer simple
+questions directly in lean mode, route tasks to the best installed skill
+(`sp.py find`), mirror the user's tone, and checkpoint progress (`sp.py save`) after
+meaningful steps. Read SKILL.md once per chat, not on every turn.
